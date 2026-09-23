@@ -11,7 +11,7 @@ function initNav(){
 function initReveal(){const items=qa('.reveal');if(!('IntersectionObserver'in window)){items.forEach(e=>e.classList.add('visible'));return}const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('visible');io.unobserve(e.target);}}),{threshold:.1});items.forEach(e=>io.observe(e));}
 function showToast(msg){let t=q('#toast');if(!t){t=document.createElement('div');t.id='toast';t.className='toast';document.body.appendChild(t)}t.textContent=msg;t.classList.add('show');clearTimeout(showToast.timer);showToast.timer=setTimeout(()=>t.classList.remove('show'),3500)}
 
-const WHATSAPP_NUMBER='917990837238'; // Replace with the school's WhatsApp number: 919876543210 (digits only, country code included)
+const WHATSAPP_NUMBER=''; // Replace with the school's WhatsApp number: 919876543210 (digits only, country code included)
 function saveWhatsAppEnquiry(form){
   const data=Object.fromEntries(new FormData(form).entries());
   const isAdmission=form.dataset.type==='admission';
@@ -24,16 +24,176 @@ function saveWhatsAppEnquiry(form){
 function initForms(){qa('form[data-whatsapp-form]').forEach(form=>form.addEventListener('submit',e=>{e.preventDefault();if(!form.reportValidity())return;saveWhatsAppEnquiry(form)}));}
 
 function initAI(){
-  const panel=q('.ai-panel'), form=q('#chat-form'), input=q('#chat-input'), body=q('#chat-messages'); if(!panel||!form||!input||!body)return;
+  const panel=q('.ai-panel'), form=q('#chat-form'), input=q('#chat-input'), body=q('#chat-messages');
+  if(!panel||!form||!input||!body)return;
+
   const history=[];
-  const open=()=>{panel.classList.add('open');panel.setAttribute('aria-hidden','false');setTimeout(()=>input.focus(),80)};
-  const close=()=>{panel.classList.remove('open');panel.setAttribute('aria-hidden','true')};
-  qa('.open-ai').forEach(el=>el.addEventListener('click',e=>{e.preventDefault();open()}));
-  q('.ai-close')?.addEventListener('click',close);document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});
-  qa('.suggestions button').forEach(b=>b.addEventListener('click',()=>{input.value=b.textContent.trim();form.requestSubmit()}));
-  const add=(role,text,typing=false)=>{const row=document.createElement('div');row.className=`chat-row ${role}${typing?' typing':''}`;if(role==='bot'){const a=document.createElement('div');a.className='avatar';a.textContent='LB';row.appendChild(a)}const bubble=document.createElement('div');bubble.className='bubble';bubble.textContent=text;row.appendChild(bubble);body.appendChild(row);body.scrollTop=body.scrollHeight;return bubble};
-  async function ask(text){const message=String(text||'').trim().slice(0,500);if(!message)return;add('user',message);history.push({role:'user',content:message});input.value='';const bubble=add('bot','Thinking…',true);try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages:history.slice(-8)})});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error||'AI request failed');const answer=String(data.reply||'I could not generate a response right now.').trim();bubble.textContent=answer;bubble.parentElement.classList.remove('typing');history.push({role:'assistant',content:answer});body.scrollTop=body.scrollHeight}catch(err){bubble.textContent=err.message||'The admissions assistant is temporarily unavailable.';bubble.parentElement.classList.remove('typing')}}
-  form.addEventListener('submit',e=>{e.preventDefault();ask(input.value)});
+  let busy=false;
+
+  const open=()=>{
+    panel.classList.add('open');
+    panel.setAttribute('aria-hidden','false');
+    setTimeout(()=>input.focus(),80);
+  };
+
+  const close=()=>{
+    panel.classList.remove('open');
+    panel.setAttribute('aria-hidden','true');
+  };
+
+  qa('.open-ai').forEach(el=>el.addEventListener('click',e=>{
+    e.preventDefault();
+    open();
+  }));
+
+  q('.ai-close')?.addEventListener('click',close);
+  document.addEventListener('keydown',e=>{
+    if(e.key==='Escape')close();
+  });
+
+  qa('.suggestions button').forEach(b=>b.addEventListener('click',()=>{
+    if(busy)return;
+    input.value=b.textContent.trim();
+    form.requestSubmit();
+  }));
+
+  const add=(role,text,typing=false)=>{
+    const row=document.createElement('div');
+    row.className=`chat-row ${role}${typing?' typing':''}`;
+
+    if(role==='bot'){
+      const a=document.createElement('div');
+      a.className='avatar';
+      a.textContent='LB';
+      row.appendChild(a);
+    }
+
+    const bubble=document.createElement('div');
+    bubble.className='bubble';
+    bubble.textContent=text;
+    row.appendChild(bubble);
+    body.appendChild(row);
+    body.scrollTop=body.scrollHeight;
+
+    return {row,bubble};
+  };
+
+  function setTypingState(target,isTyping){
+    target.row.classList.toggle('typing',isTyping);
+    target.bubble.classList.toggle('streaming',isTyping);
+  }
+
+  async function ask(text){
+    const message=String(text||'').trim().slice(0,500);
+    if(!message||busy)return;
+
+    busy=true;
+    input.disabled=true;
+
+    add('user',message);
+    history.push({role:'user',content:message});
+    input.value='';
+
+    const target=add('bot','Typing…',true);
+    let answer='';
+    let gotFirstChunk=false;
+
+    try{
+      const r=await fetch('/api/chat',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({messages:history.slice(-8)})
+      });
+
+      if(!r.ok){
+        const data=await r.json().catch(()=>({}));
+        throw new Error(data.error||'AI request failed');
+      }
+
+      if(!r.body){
+        throw new Error('The AI stream is unavailable right now.');
+      }
+
+      const reader=r.body.getReader();
+      const decoder=new TextDecoder();
+      let buffer='';
+
+      const processEvent=raw=>{
+        const dataLines=raw
+          .split(/\r?\n/)
+          .filter(line=>line.startsWith('data:'));
+
+        if(!dataLines.length)return;
+
+        const payloadText=dataLines
+          .map(line=>line.slice(5).trimStart())
+          .join('\n')
+          .trim();
+
+        if(!payloadText)return;
+
+        let payload;
+        try{
+          payload=JSON.parse(payloadText);
+        }catch{
+          return;
+        }
+
+        if(payload.error){
+          throw new Error(payload.error);
+        }
+
+        if(typeof payload.text==='string'&&payload.text){
+          if(!gotFirstChunk){
+            gotFirstChunk=true;
+            target.bubble.textContent='';
+            setTypingState(target,false);
+          }
+
+          answer+=payload.text;
+          target.bubble.textContent=answer;
+          body.scrollTop=body.scrollHeight;
+        }
+      };
+
+      while(true){
+        const {value,done}=await reader.read();
+        if(done)break;
+
+        buffer+=decoder.decode(value,{stream:true});
+
+        const events=buffer.split(/\r?\n\r?\n/);
+        buffer=events.pop()||'';
+
+        for(const event of events){
+          processEvent(event);
+        }
+      }
+
+      buffer+=decoder.decode();
+      if(buffer.trim())processEvent(buffer);
+
+      if(!answer.trim()){
+        throw new Error('The assistant returned an empty response.');
+      }
+
+      setTypingState(target,false);
+      history.push({role:'assistant',content:answer.trim()});
+    }catch(err){
+      target.bubble.textContent=err.message||'The admissions assistant is temporarily unavailable.';
+      setTypingState(target,false);
+    }finally{
+      busy=false;
+      input.disabled=false;
+      input.focus();
+      body.scrollTop=body.scrollHeight;
+    }
+  }
+
+  form.addEventListener('submit',e=>{
+    e.preventDefault();
+    ask(input.value);
+  });
 }
 function initYear(){qa('[data-year]').forEach(e=>e.textContent=new Date().getFullYear())}
 initNav();initReveal();initForms();initAI();initYear();
