@@ -1,0 +1,7 @@
+Little Bloom preschool palette
+Navy: #24324B
+Light Green: #BFE8C2
+Light Yellow: #FFE79A
+Light Orange: #FFC5A8
+Light Purple: #DCCCF7
+Light Blue: #C9E9F7
