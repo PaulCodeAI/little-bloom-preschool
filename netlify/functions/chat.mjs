@@ -1,4 +1,4 @@
-// Little Bloom Preschool — Netlify AI Admissions Assistant
+// Little Bloom Preschool — Netlify Streaming AI Admissions Assistant
 // Gemini API key must stay in Netlify Environment Variables.
 
 const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
@@ -7,7 +7,7 @@ const KEY = process.env.GEMINI_API_KEY;
 const context = `
 You are the Virtual Admissions Assistant for Little Bloom Early Learning Centre, a sample preschool website serving families in Surat, Gujarat.
 
-Speak naturally and warmly, like a helpful admissions desk assistant, while remaining accurate.
+Speak naturally and warmly, like a helpful admissions desk assistant, while remaining accurate and concise.
 
 Use only the school facts below. Do not invent teachers, awards, student counts, facilities, transport routes, discounts, policies, certificates, medical services or exact admission dates.
 
@@ -56,13 +56,16 @@ function json(body, status = 200) {
   });
 }
 
-function allowed(req) {
-  const key = (
+function clientId(req) {
+  return (
     req.headers.get('x-nf-client-connection-ip') ||
     req.headers.get('x-forwarded-for') ||
     'unknown'
   ).split(',')[0].trim();
+}
 
+function allowed(req) {
+  const key = clientId(req);
   const now = Date.now();
   const item = hits.get(key);
 
@@ -90,8 +93,27 @@ function cleanMessages(messages) {
     .slice(-8)
     .map(x => ({
       role: x.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: x.content.slice(0, 1200) }]
+      parts: [{ text: x.content.slice(0, 1000) }]
     }));
+}
+
+function extractText(payload) {
+  const parts = payload?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return '';
+
+  return parts
+    .filter(part => part && part.thought !== true && typeof part.text === 'string')
+    .map(part => part.text)
+    .join('');
+}
+
+function sseHeaders() {
+  return {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',
+    'X-Content-Type-Options': 'nosniff'
+  };
 }
 
 export default async function handler(req) {
@@ -131,12 +153,12 @@ export default async function handler(req) {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45000);
+  const timeout = setTimeout(() => controller.abort(), 55000);
 
   try {
     const url =
       `https://generativelanguage.googleapis.com/v1beta/models/` +
-      `${encodeURIComponent(MODEL)}:generateContent`;
+      `${encodeURIComponent(MODEL)}:streamGenerateContent?alt=sse`;
 
     const response = await fetch(url, {
       method: 'POST',
@@ -151,16 +173,18 @@ export default async function handler(req) {
         },
         contents,
         generationConfig: {
-          maxOutputTokens: 500
+          thinkingConfig: {
+            thinkingLevel: 'minimal'
+          },
+          maxOutputTokens: 320
         }
       })
     });
 
-    const data = await response.json().catch(() => ({}));
-
     if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
       console.error(
-        'Gemini error',
+        'Gemini stream error',
         response.status,
         data?.error?.message
       );
@@ -169,32 +193,137 @@ export default async function handler(req) {
         return json(
           {
             error:
-              'The free AI limit has been reached for now. Please try again later.'
+              'The AI service is temporarily busy or has reached its free limit. Please try again shortly.'
           },
           429
         );
       }
 
       return json(
-        { error: 'The admissions assistant is temporarily unavailable.' },
+        {
+          error:
+            data?.error?.message ||
+            'The admissions assistant is temporarily unavailable.'
+        },
         502
       );
     }
 
-    const reply = data?.candidates?.[0]?.content?.parts
-      ?.map(part => part.text || '')
-      .join('')
-      .trim();
-
-    if (!reply) {
+    if (!response.body) {
       return json(
-        { error: 'The assistant returned an empty response.' },
+        { error: 'The AI stream is unavailable right now.' },
         502
       );
     }
 
-    return json({ reply });
+    const upstream = response.body;
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        const reader = upstream.getReader();
+        let buffer = '';
+
+        const send = payload => {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(payload)}\n\n`)
+          );
+        };
+
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            const events = buffer.split(/\r?\n\r?\n/);
+            buffer = events.pop() || '';
+
+            for (const event of events) {
+              const lines = event
+                .split(/\r?\n/)
+                .filter(line => line.startsWith('data:'));
+
+              if (!lines.length) continue;
+
+              const raw = lines
+                .map(line => line.slice(5).trimStart())
+                .join('\n')
+                .trim();
+
+              if (!raw || raw === '[DONE]') continue;
+
+              try {
+                const payload = JSON.parse(raw);
+                const text = extractText(payload);
+
+                if (text) {
+                  send({ text });
+                }
+              } catch (parseError) {
+                console.warn('Ignored malformed Gemini SSE chunk.', parseError);
+              }
+            }
+          }
+
+          const tail = decoder.decode();
+          buffer += tail;
+
+          if (buffer.trim()) {
+            const lines = buffer
+              .split(/\r?\n/)
+              .filter(line => line.startsWith('data:'));
+
+            const raw = lines
+              .map(line => line.slice(5).trimStart())
+              .join('\n')
+              .trim();
+
+            if (raw && raw !== '[DONE]') {
+              try {
+                const payload = JSON.parse(raw);
+                const text = extractText(payload);
+                if (text) send({ text });
+              } catch {}
+            }
+          }
+
+          send({ done: true });
+          controller.close();
+        } catch (error) {
+          console.error('Gemini streaming error', error);
+
+          try {
+            send({
+              error:
+                error?.name === 'AbortError'
+                  ? 'The assistant took too long to respond. Please try again.'
+                  : 'The admissions assistant connection was interrupted.'
+            });
+          } finally {
+            controller.close();
+          }
+        } finally {
+          clearTimeout(timeout);
+          try {
+            reader.releaseLock();
+          } catch {}
+        }
+      },
+
+      cancel() {
+        clearTimeout(timeout);
+      }
+    });
+
+    return new Response(stream, {
+      status: 200,
+      headers: sseHeaders()
+    });
   } catch (err) {
+    clearTimeout(timeout);
     console.error(err);
 
     return json(
@@ -206,8 +335,6 @@ export default async function handler(req) {
       },
       502
     );
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
